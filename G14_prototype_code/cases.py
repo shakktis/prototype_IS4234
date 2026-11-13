@@ -131,9 +131,9 @@ BORROWER_RECORDS = {
 # ------------------------------------------------------------------ example source tables
 # Ownership and officer records (ACRA business-profile style). Key: entity. Value: links to others.
 OWNERSHIP = {
-    OTK.lower(): {HLT.lower(): "Sister company of the borrower: both owned and controlled by the Lim family "
-                               "(SGDC 36 paras 109, 260)."},
-    UT.lower(): {HLT.lower(): "The terminal's parent was 41% owned by the Lim family, who control the borrower "
+    OTK.lower(): {HLT.lower(): "The issuer is a sister company of the borrower: both are owned and controlled by the "
+                               "Lim family (SGDC 36 paras 109, 260)."},
+    UT.lower(): {HLT.lower(): "The issuer's parent company was 41% owned by the Lim family, who control the borrower "
                               "(SGDC 36 paras 263 to 265)."},
     PCS.lower(): {},
     "blue strait lines pte ltd": {},
@@ -147,19 +147,20 @@ ENTITY_REGISTER = {
     "selat bunker trading pte ltd": ("struck off", "Struck off the register in 2018."),
 }
 # ABS Trade Finance Registry: invoices already financed elsewhere.
-REGISTRY_DUPLICATES = {"KBS-INV-3391": "Invoice already financed at another participating bank on 2020-02-27."}
+REGISTRY_DUPLICATES = {"KBS-INV-3391": "The registry records this invoice as already financed by another participating bank on 2020-02-27."}
 # Ship tracking (AIS) around the document date.
 VESSEL_TRACKING = {
     "mt ocean demo (placeholder name)": ("contradicted",
-        "Vessel was already laden and under way to Rotterdam, not loading at the stated port "
-        "(SGDC 36 paras 385 to 386)."),
-    "mt pacific heron": ("confirmed", "Vessel was alongside at the stated port on the document date."),
-    "mt blue strait": ("confirmed", "Vessel was alongside at the stated port on the document date."),
+        "Ship-tracking records show the vessel was already laden and under way to Rotterdam on the document "
+        "date, not loading at the stated port (SGDC 36 paras 385 to 386)."),
+    "mt pacific heron": ("confirmed", "Ship-tracking records place the vessel alongside at the stated port on the document date."),
+    "mt blue strait": ("confirmed", "Ship-tracking records place the vessel alongside at the stated port on the document date."),
 }
 # Terminal or warehouse operator confirmations.
 TERMINAL_CONFIRMATION = {
-    "harbourside tank storage pte ltd": ("confirmed", "Operator confirms the transfer between the named tanks."),
-    UT.lower(): ("contradicted", "Buyer rents no tanks at this terminal (SGDC 36 para 265)."),
+    "harbourside tank storage pte ltd": ("confirmed", "The operator confirms the transfer between the named tanks on the document date."),
+    UT.lower(): ("contradicted", "The terminal operator's records show that the buyer rents no tanks at this terminal, so no "
+                 "transfer to the buyer could have taken place there (SGDC 36 para 265)."),
 }
 # Benchmark prices, USD/bbl, by product and month.
 BENCHMARKS = {("gasoil 10ppm sulphur", "2020-02"): 62.0, ("gasoil 10ppm sulphur", "2020-03"): 42.5,
@@ -184,8 +185,8 @@ def _pdf_date(d):
 def read_pack(data: bytes):
     """Read a request pack PDF. Returns (fields, docs, forensics)."""
     reader = PdfReader(io.BytesIO(data))
-    pages = {}
-    for page in reader.pages:
+    pages, page_no = {}, {}
+    for n, page in enumerate(reader.pages, start=1):
         title, kv = None, {}
         for line in (page.extract_text() or "").splitlines():
             line = line.strip()
@@ -196,6 +197,7 @@ def read_pack(data: bytes):
                 kv[k.strip().lower()] = v.strip()
         if title:
             pages[title.lower()] = kv
+            page_no[title.lower()] = n
 
     contract = pages.get("sales contract", {})
     invoice = pages.get("commercial invoice", {})
@@ -234,6 +236,9 @@ def read_pack(data: bytes):
         load_port=transport.get("port of loading") or "",
         terminal=transport.get("terminal") or "",
         doc_date=transport.get("document date") or "",
+        pages={k: v for k, v in (("contract", page_no.get("sales contract")), ("invoice", page_no.get("commercial invoice")),
+                                 ("transport", page_no.get(tkey) if tkey else None),
+                                 ("request", page_no.get("discounting request"))) if v},
     )
 
     meta = reader.metadata
@@ -242,29 +247,44 @@ def read_pack(data: bytes):
     producer = (getattr(meta, "producer", None) if meta else None) or "unknown"
     if created and modified and (modified - created).total_seconds() > 60:
         forensics = dict(status="fail", source="Live: file metadata",
-                         detail=f"File was modified after it was created (created {_pdf_date(created)}, "
-                                f"modified {_pdf_date(modified)}; producer: {producer}).")
+                         detail=f"The file was modified after it was created. Created {_pdf_date(created)}, "
+                                f"modified {_pdf_date(modified)}. Producing software: {producer}.")
     elif created:
         forensics = dict(status="pass", source="Live: file metadata",
-                         detail=f"No modification after creation (created {_pdf_date(created)}; producer: {producer}).")
+                         detail=f"No modification is recorded after creation. Created {_pdf_date(created)}. "
+                                f"Producing software: {producer}.")
     else:
-        forensics = dict(status="unchecked", source="Live: file metadata", detail="File carries no creation metadata.")
+        forensics = dict(status="unchecked", source="Live: file metadata",
+                         detail="The file carries no creation metadata, so editing could not be assessed.")
     return fields, docs, forensics
 
 
 # ------------------------------------------------------------------ evidence gathering
+DOC_NAMES = {"contract": "Sales contract", "invoice": "Commercial invoice", "request": "Discounting request"}
+
+
+def doc_ref(req, kind, *labels):
+    """Where a value was read from: document, page of the pack, and field name(s)."""
+    name = DOC_NAMES.get(kind) or (req.get("doc_type") or "Transport document")
+    fields = ("field " if len(labels) == 1 else "fields ") + ", ".join(f"'{x}'" for x in labels)
+    page = (req.get("pages") or {}).get(kind)
+    if page:
+        return f"{name}, page {page} of {req.get('pack_name') or 'the request pack'}, {fields}"
+    return f"{name} details entered on the request form, {fields}"
+
+
 def _linked(entity, borrower):
     """True / False / None (unknown) from ownership records."""
     e, b = (entity or "").strip().lower(), (borrower or "").strip().lower()
     if not e:
-        return None, "No issuer named."
+        return None, "The document names no issuer."
     if e == b:
         return True, "The issuer is the borrower itself."
     if e in OWNERSHIP:
         if b in OWNERSHIP[e]:
             return True, OWNERSHIP[e][b]
-        return False, "No shared owners or directors with the borrower found."
-    return None, "Issuer not found in ownership records."
+        return False, "No shared owners or directors with the borrower were found."
+    return None, "The issuer was not found in the ownership records searched."
 
 
 def gather(req, overrides=None, gleif=None):
@@ -272,6 +292,11 @@ def gather(req, overrides=None, gleif=None):
     response by hand; `gleif` is an optional live lookup callable(name) -> dict|None."""
     ov = overrides or {}
     borrower = req.get("borrower", "")
+    buyer = (req.get("buyer") or "").strip()
+    product = req.get("product") or "goods"
+    qty = f"{float(req.get('quantity') or 0):,.0f} bbl"
+    ddate = req.get("doc_date") or "date not stated"
+    manual = "Response set manually for this demonstration."
     ev = {"forensics": req.get("forensics")}
 
     # Issuer independence (Check 1) -------------------------------------------
@@ -281,118 +306,133 @@ def gather(req, overrides=None, gleif=None):
         linked = True
     src = f"{EX}: ACRA-style ownership and officer records"
     if ov.get("issuer") == "Independent":
-        linked, detail, src = False, "Set by hand for this demo.", "Entered by hand"
+        linked, detail, src = False, manual, "Entered by hand"
     elif ov.get("issuer") == "Linked to borrower":
-        linked, detail, src = True, "Set by hand for this demo.", "Entered by hand"
+        linked, detail, src = True, manual, "Entered by hand"
     elif ov.get("issuer") == "Unknown":
-        linked, detail, src = None, "Set by hand for this demo.", "Entered by hand"
-    ev["issuer_link"] = dict(linked=linked, detail=detail, source=src)
+        linked, detail, src = None, manual, "Entered by hand"
+    ev["issuer_link"] = dict(linked=linked, detail=detail, source=src,
+                             doc_ref=doc_ref(req, "transport", "Issuer", "Signed by"),
+                             stated=f"Issued by {req.get('issuer') or 'not stated'}; signed by "
+                                    f"{req.get('signatory') or 'not stated'}.")
 
     c3 = []
 
-    def add(key, name, status, detail, source, hard=True):
+    def add(key, name, status, detail, source, ref, stated, hard=True):
         o = ov.get(key)
         if o in ("confirmed", "unchecked", "contradicted"):
-            status, detail, source = o, "Set by hand for this demo.", "Entered by hand"
-        c3.append(dict(key=key, name=name, status=status, detail=detail, source=source, hard=hard))
+            status, detail, source = o, manual, "Entered by hand"
+        c3.append(dict(key=key, name=name, status=status, detail=detail, source=source, doc_ref=ref,
+                       stated=stated, hard=hard))
 
-    # 1. Registry duplicate / carrier genuineness -----------------------------
+    # 3.1 Registry duplicate ---------------------------------------------------
     inv = (req.get("invoice_no") or "").strip()
+    name, src = "No duplicate financing in the Trade Finance Registry", f"{EX}: ABS Trade Finance Registry"
+    ref, stated = doc_ref(req, "invoice", "Invoice no"), f"Invoice {inv or '(none)'} is presented for financing."
     if not inv:
-        add("registry", "No duplicate financing in the Trade Finance Registry", "unchecked",
-            "No invoice number to search.", f"{EX}: ABS Trade Finance Registry")
+        add("registry", name, "unchecked", "No invoice number was given, so the registry could not be searched.", src, ref, stated)
     elif inv in REGISTRY_DUPLICATES:
-        add("registry", "No duplicate financing in the Trade Finance Registry", "contradicted",
-            REGISTRY_DUPLICATES[inv], f"{EX}: ABS Trade Finance Registry")
+        add("registry", name, "contradicted", REGISTRY_DUPLICATES[inv], src, ref, stated)
     else:
-        add("registry", "No duplicate financing in the Trade Finance Registry", "confirmed",
-            f"No other financing found against invoice {inv}.", f"{EX}: ABS Trade Finance Registry")
+        add("registry", name, "confirmed", f"No other financing is recorded against invoice {inv}.", src, ref, stated)
 
-    # 2. Did the goods move? Rule depends on the transport document type ------
+    # 3.2 Did the goods move? Rule depends on the transport document type ------
     dt = req.get("doc_type") or ""
     name = "Independent proof that the goods moved"
     if dt == "Bill of lading":
-        v = (req.get("vessel") or "").strip().lower()
-        if not v:
-            add("movement", name, "unchecked", "Bill of lading names no vessel.", f"{EX}: ship tracking (AIS)")
-        elif v in VESSEL_TRACKING:
-            add("movement", name, *VESSEL_TRACKING[v], f"{EX}: ship tracking (AIS)")
+        vessel = (req.get("vessel") or "").strip()
+        ref = doc_ref(req, "transport", "Vessel", "Port of loading", "Document date")
+        stated = (f"{qty} of {product} loaded on {vessel or 'an unnamed vessel'} at "
+                  f"{req.get('load_port') or 'an unstated port'}; document dated {ddate}.")
+        src = f"{EX}: ship tracking (AIS)"
+        if not vessel:
+            add("movement", name, "unchecked", "The bill of lading names no vessel.", src, ref, stated)
+        elif vessel.lower() in VESSEL_TRACKING:
+            st_, d = VESSEL_TRACKING[vessel.lower()]
+            add("movement", name, st_, d, src, ref, stated)
         else:
-            add("movement", name, "unchecked", "Vessel not found in tracking data.", f"{EX}: ship tracking (AIS)")
+            add("movement", name, "unchecked", "The vessel was not found in the tracking data.", src, ref, stated)
     elif dt in ("Inter-tank transfer certificate", "Warehouse receipt"):
         t = (req.get("terminal") or req.get("issuer") or "").strip()
+        ref = doc_ref(req, "transport", "Terminal", "Consignee", "Quantity (bbl)")
+        stated = f"{qty} of {product} transferred to {buyer or 'the buyer'} at {t or 'an unnamed facility'}; document dated {ddate}."
+        src = f"{EX}: terminal operator"
         t_linked, t_detail = _linked(t, borrower)
         resp = TERMINAL_CONFIRMATION.get(t.lower())
         if not t:
-            add("movement", name, "unchecked", "No terminal or warehouse named.", f"{EX}: terminal operator")
+            add("movement", name, "unchecked", "The document names no terminal or warehouse.", src, ref, stated)
         elif resp and resp[0] == "contradicted":
-            add("movement", name, "contradicted", resp[1], f"{EX}: terminal operator")
+            add("movement", name, "contradicted", resp[1], src, ref, stated)
         elif t_linked:
             add("movement", name, "unchecked",
-                "The operator is linked to the borrower, so its confirmation does not count. " + t_detail,
-                f"{EX}: terminal operator")
+                "The operator is linked to the borrower, so its confirmation does not count as independent. " + t_detail,
+                src, ref, stated)
         elif resp:
-            add("movement", name, resp[0], resp[1], f"{EX}: terminal operator")
+            add("movement", name, resp[0], resp[1], src, ref, stated)
         else:
-            add("movement", name, "unchecked", "Operator has not confirmed the transfer.", f"{EX}: terminal operator")
+            add("movement", name, "unchecked", "The operator has not confirmed the transfer.", src, ref, stated)
     else:
-        add("movement", name, "unchecked", f"No data source is connected for '{dt}' in this demonstrator.",
-            "Not connected")
+        add("movement", name, "unchecked",
+            f"No data source is connected for a {dt.lower()} in this demonstrator.", "Not connected",
+            doc_ref(req, "transport", "Document type"), f"Goods moved under a {dt.lower()} dated {ddate}.")
 
-    # 3. Buyer exists and is independent --------------------------------------
-    buyer = (req.get("buyer") or "").strip()
+    # 3.3 Buyer exists and is independent --------------------------------------
     name = "Buyer exists and is independent of the borrower"
+    ref, stated = doc_ref(req, "invoice", "Buyer"), f"The buyer is {buyer or '(not stated)'}."
     b_linked = buyer.lower() in OWNERSHIP and borrower.lower() in OWNERSHIP[buyer.lower()]
     live = gleif(buyer) if (gleif and buyer) else None
     if not buyer:
-        add("buyer", name, "unchecked", "No buyer named.", "Company registers")
+        add("buyer", name, "unchecked", "No buyer is named.", "Company registers", ref, stated)
     elif b_linked:
-        add("buyer", name, "unchecked", "Buyer shares owners with the borrower, so the sale is not at arm's length. "
-            + OWNERSHIP[buyer.lower()][borrower.lower()], f"{EX}: ACRA-style ownership records")
+        add("buyer", name, "unchecked", "The buyer shares owners with the borrower, so the sale is not at arm's length. "
+            + OWNERSHIP[buyer.lower()][borrower.lower()], f"{EX}: ACRA-style ownership records", ref, stated)
     elif live:
         st_ = (live.get("status") or "").upper()
         add("buyer", name, "confirmed" if st_ == "ACTIVE" else "contradicted",
-            f"LEI {live['lei']}: {live['name']} ({live.get('country', '')}), entity status {st_ or 'unknown'}.",
-            "Live: GLEIF LEI register")
+            f"Registered as {live['name']} ({live.get('country', '')}), LEI {live['lei']}, entity status {st_ or 'unknown'}.",
+            "Live: GLEIF LEI register", ref, stated)
     elif buyer.lower() in ENTITY_REGISTER:
         s, d = ENTITY_REGISTER[buyer.lower()]
-        add("buyer", name, "confirmed" if s == "live" else "contradicted", d, f"{EX}: company register")
+        add("buyer", name, "confirmed" if s == "live" else "contradicted", d, f"{EX}: company register", ref, stated)
     else:
-        add("buyer", name, "unchecked", "Buyer not found in the registers searched.", "Company registers")
+        add("buyer", name, "unchecked", "The buyer was not found in the registers searched.", "Company registers", ref, stated)
 
-    # 4. Price near market -----------------------------------------------------
-    name = "Price is near the market price"
+    # 3.4 Price near market ----------------------------------------------------
+    name, src = "Price is near the market price", f"{EX}: benchmark prices"
     bench = BENCHMARKS.get(((req.get("product") or "").strip().lower(), str(req.get("price_date") or "")[:7]))
     up = req.get("unit_price") or 0
+    ref = doc_ref(req, "contract", "Unit price (USD/bbl)")
+    stated = f"Unit price US${up:,.2f} per bbl for {product}." if up else "No unit price is stated."
     if not bench or not up:
-        add("price", name, "unchecked", "No benchmark for this product and month, or no unit price given.",
-            f"{EX}: benchmark prices")
+        add("price", name, "unchecked", "No benchmark is held for this product and month, or no unit price was given.",
+            src, ref, stated)
     else:
         diff = (up - bench) / bench
         add("price", name, "confirmed" if abs(diff) <= engine.PRICE_BAND else "contradicted",
-            f"Unit price US${up:,.2f} against benchmark US${bench:,.2f} ({diff:+.1%}; allowed band "
-            f"+/-{engine.PRICE_BAND:.0%}).", f"{EX}: benchmark prices")
+            f"Benchmark for the invoice month is US${bench:,.2f} per bbl. The stated price differs by {diff:+.1%}; "
+            f"the permitted band is plus or minus {engine.PRICE_BAND:.0%}.", src, ref, stated)
 
-    # 5. Adverse news (raises the score but is not an outright contradiction) --
-    name = "No adverse news on the borrower or buyer"
+    # 3.5 Adverse news (raises the score but is not an outright contradiction) --
+    name, src = "No adverse news on the borrower or buyer", f"{EX}: news screening"
+    ref, stated = doc_ref(req, "request", "Borrower"), f"Borrower {borrower or '(not stated)'}; buyer {buyer or '(not stated)'}."
     hit = next((ADVERSE_NEWS[n.lower()] for n in (borrower, buyer) if n and n.lower() in ADVERSE_NEWS), None)
     if hit:
-        add("news", name, "contradicted", hit, f"{EX}: news screening", hard=False)
+        add("news", name, "contradicted", hit, src, ref, stated, hard=False)
     elif borrower.lower() in NEWS_COVERED:
-        add("news", name, "confirmed", "No adverse reports in the 90 days before the request.",
-            f"{EX}: news screening", hard=False)
+        add("news", name, "confirmed", "No adverse reports in the 90 days before the request.", src, ref, stated, hard=False)
     else:
-        add("news", name, "unchecked", "Company not covered by the news source.", f"{EX}: news screening", hard=False)
+        add("news", name, "unchecked", "The company is not covered by the news source.", src, ref, stated, hard=False)
 
     ev["c3"] = c3
     return ev
 
 
-def build_request(fields, docs=None, forensics=None):
+def build_request(fields, docs=None, forensics=None, pack_name=""):
     """Turn form fields into a request, attaching bank-held records for the borrower if any."""
     req = dict(fields)
     req["docs"] = docs or {}
     req["forensics"] = forensics
+    req["pack_name"] = pack_name
     req["price_date"] = fields.get("contract_date") or fields.get("invoice_date") or ""
     rec = BORROWER_RECORDS.get((fields.get("borrower") or "").strip().lower())
     if "financials" not in req:
@@ -400,6 +440,14 @@ def build_request(fields, docs=None, forensics=None):
     if "signals" not in req:
         req["signals"] = rec["signals"] if rec else {}
     req["records_note"] = rec["note"] if rec else ""
+    pages = req.get("pages") or {}
+    if pack_name and pages:
+        names = [f"{DOC_NAMES.get(k) or req.get('doc_type') or 'Transport document'} (page {p})"
+                 for k, p in sorted(pages.items(), key=lambda kv: kv[1]) if k != "request"]
+        req["refs"] = dict(all_docs=f"{pack_name}: " + ", ".join(names), file=f"{pack_name} (PDF file properties)")
+    else:
+        req["refs"] = dict(all_docs="Request documents as entered on the request form",
+                           file="No file supplied")
     return req
 
 

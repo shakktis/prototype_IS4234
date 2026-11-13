@@ -1,28 +1,31 @@
 """Trade Authenticity Risk Scorer: scoring engine.
 
 Pure functions. No company-specific logic: every rule works on the fields of a
-request and on the evidence gathered for it.
+request and on the evidence gathered for it. Every test result carries the document
+reference it examined, what that document states, and what the evidence shows, so
+the decision can be explained line by line.
 """
 from statistics import mean, pstdev
 
 WEIGHTS = {"c1": 0.30, "c2": 0.30, "c3": 0.40}
 STATUS_POINTS = {"confirmed": 0, "unchecked": 50, "contradicted": 100}
-STATUS_LABEL = {
-    "confirmed": "Outside evidence agrees",
-    "unchecked": "Could not check",
-    "contradicted": "Outside evidence disagrees",
-}
+RESULT_LABEL = {"confirmed": "Verified", "unchecked": "Not verified", "contradicted": "Contradicted",
+                "pass": "Pass", "fail": "Fail", "adverse": "Adverse"}
 BAND_ORDER = ["Low", "Medium", "High", "Critical"]
+BAND_RANGE = {"Low": "0 to 29", "Medium": "30 to 49", "High": "50 to 69", "Critical": "70 to 100"}
 BAND_ACTION = {
-    "Low": "Paid as normal. Logged only.",
-    "Medium": "Paid once the officer records a short note. Logged only.",
-    "High": "Held until a named Risk Management Unit reviewer approves.",
-    "Critical": "Blocked until a named Risk Management Unit reviewer clears it.",
+    "Low": "Payment released as normal. The result is logged.",
+    "Medium": "Payment released once the submitting officer records a short note. The result is logged.",
+    "High": "Payment held until a named Risk Management Unit reviewer approves it.",
+    "Critical": "Payment blocked until a named Risk Management Unit reviewer clears it.",
 }
 Z_SAFE, Z_DISTRESS = 2.6, 1.1
-MIN_HISTORY = 8          # past 90-day periods needed to judge "normal"
-PRICE_BAND = 0.10        # +/- 10% of benchmark
+MIN_HISTORY = 8            # past 90-day periods needed to judge "normal"
+PRICE_BAND = 0.10          # +/- 10% of benchmark
 R3_THRESHOLD = 10_000_000  # large silent deal (USD), example value
+C1, C2, C3 = "Check 1: Documents", "Check 2: Company", "Check 3: Transaction"
+ACCOUNTS_REF = "Borrower accounts held by the bank (not part of the request pack)"
+SIGNALS_REF = "Public records on the borrower (not part of the request pack)"
 
 SIGNALS = {
     "news_volume": "News volume",
@@ -53,44 +56,45 @@ def _norm(v):
 
 # ---------------------------------------------------------------- Check 1
 def check1(req, ev):
+    refs = req.get("refs") or {}
     tests = []
 
-    # 1a. Consistency across the documents
+    # 1.1 Consistency across the documents
     docs = req.get("docs") or {}
     mism = []
     for field in ("buyer", "product", "quantity", "amount"):
         seen = {n: _norm(d[field]) for n, d in docs.items() if d.get(field) not in (None, "")}
         if len(set(seen.values())) > 1:
             mism.append(field + " (" + "; ".join(f"{n}: {docs[n][field]}" for n in seen) + ")")
+    base = dict(id="1.1", name="Documents agree with each other",
+                doc_ref=refs.get("all_docs", "Request documents"),
+                stated="Buyer, product, quantity and amount as stated in each document.")
     if not docs:
-        tests.append(dict(name="Documents agree with each other", result="unchecked", points=0,
-                          detail="No document pack was read.", source="Document reader"))
+        tests.append(dict(base, result="unchecked", points=0, found="No document pack was read, so the documents "
+                          "could not be compared.", source="Document reader"))
     elif mism:
-        tests.append(dict(name="Documents agree with each other", result="fail", points=30,
-                          detail="Mismatch on " + ", ".join(mism), source="Live: document reader"))
+        tests.append(dict(base, result="fail", points=30, found="The documents disagree on " + ", ".join(mism) + ".",
+                          source="Live: document reader"))
     else:
-        tests.append(dict(name="Documents agree with each other", result="pass", points=0,
-                          detail="Buyer, product, quantity and amount match across "
-                                 + ", ".join(docs.keys()) + ".", source="Live: document reader"))
+        tests.append(dict(base, result="pass", points=0, found="Buyer, product, quantity and amount match across "
+                          + ", ".join(docs.keys()) + ".", source="Live: document reader"))
 
-    # 1b. Signs of editing in file metadata
-    f = ev.get("forensics") or {"status": "unchecked", "detail": "No file to inspect."}
-    tests.append(dict(name="No signs of editing in file metadata",
+    # 1.2 Signs of editing in file metadata
+    f = ev.get("forensics") or {"status": "unchecked", "detail": "No file was supplied, so metadata could not be inspected."}
+    tests.append(dict(id="1.2", name="No sign of editing in the file metadata",
+                      doc_ref=refs.get("file", "Request pack file"),
+                      stated="File creation and modification records.",
                       result={"pass": "pass", "fail": "fail"}.get(f["status"], "unchecked"),
                       points=30 if f["status"] == "fail" else 0,
-                      detail=f["detail"], source=f.get("source", "File metadata")))
+                      found=f["detail"], source=f.get("source", "File metadata")))
 
-    # 1c. Issuer of the transport document is independent of the borrower
-    il = ev.get("issuer_link") or {"linked": None, "detail": "Ownership not looked up."}
-    if il["linked"] is True:
-        res, pts = "fail", 40
-    elif il["linked"] is False:
-        res, pts = "pass", 0
-    else:
-        res, pts = "unchecked", 0
-    tests.append(dict(name="Transport document issuer is independent of the borrower",
-                      result=res, points=pts, detail=il["detail"],
-                      source=il.get("source", "Ownership records")))
+    # 1.3 Issuer of the transport document is independent of the borrower
+    il = ev.get("issuer_link") or {"linked": None, "detail": "Ownership records were not searched."}
+    res, pts = ("fail", 40) if il["linked"] is True else ("pass", 0) if il["linked"] is False else ("unchecked", 0)
+    tests.append(dict(id="1.3", name="Transport document issuer is independent of the borrower",
+                      doc_ref=il.get("doc_ref", "Transport document"), stated=il.get("stated", ""),
+                      result=res, points=pts, found=il["detail"], source=il.get("source", "Ownership records"),
+                      issuer_test=True))
 
     return dict(score=clamp(sum(t["points"] for t in tests)), tests=tests)
 
@@ -128,10 +132,11 @@ def check2(req, ev):
     az = altman_z(fin) if fin else None
     if az:
         health = health_from_z(az["z"])
-        zone = "safe" if az["z"] >= Z_SAFE else "distressed" if az["z"] <= Z_DISTRESS else "grey zone"
-        health_detail = f"Z'' = {az['z']:.2f} ({zone}). Health {health:.0f}/100."
+        zone = "safe zone" if az["z"] >= Z_SAFE else "distress zone" if az["z"] <= Z_DISTRESS else "grey zone"
+        health_detail = f"Altman Z'' = {az['z']:.2f} ({zone}). Financial health {health:.0f} out of 100."
     else:
-        health, health_detail = 50.0, "No accounts held, so health could not be checked (scored 50)."
+        health, zone = 50.0, None
+        health_detail = "The bank holds no accounts for this borrower. Financial health could not be assessed and is scored 50."
 
     rows, scores = [], []
     sig = req.get("signals") or {}
@@ -140,24 +145,23 @@ def check2(req, ev):
         d = signal_deviation(s.get("recent"), s.get("history"))
         if d is None:
             rows.append(dict(signal=label, recent=s.get("recent"), normal=None, score=50.0,
-                             note="Too little history: could not check"))
+                             reading="Not verified: fewer than %d earlier periods" % MIN_HISTORY))
             scores.append(50.0)
         else:
-            rows.append(dict(signal=label, recent=s["recent"], normal=round(d["mean"], 1),
-                             score=round(d["score"], 0),
-                             note="Unusual for this company" if d["score"] >= 50 else "Within its normal range"))
+            rows.append(dict(signal=label, recent=s["recent"], normal=round(d["mean"], 1), score=round(d["score"], 0),
+                             reading="Unusual for this company" if d["score"] >= 50 else "Within its normal range"))
             scores.append(d["score"])
     deviation = mean(scores)
     score = 0.5 * (100 - health) + 0.5 * deviation
-    return dict(score=clamp(score), health=health, health_detail=health_detail, z=az,
+    return dict(score=clamp(score), health=health, health_detail=health_detail, z=az, zone=zone,
                 deviation=deviation, signals=rows, has_accounts=bool(az))
 
 
 # ---------------------------------------------------------------- Check 3
 def check3(req, ev):
     subs = []
-    for s in ev.get("c3", []):
-        s = dict(s)
+    for i, s in enumerate(ev.get("c3", []), start=1):
+        s = dict(s, id=f"3.{i}")
         s["points"] = STATUS_POINTS[s["status"]]
         subs.append(s)
     score = mean(s["points"] for s in subs) if subs else 50.0
@@ -169,51 +173,106 @@ def score_request(req, ev):
     c1, c2, c3 = check1(req, ev), check2(req, ev), check3(req, ev)
     overall = WEIGHTS["c1"] * c1["score"] + WEIGHTS["c2"] * c2["score"] + WEIGHTS["c3"] * c3["score"]
     base_band = band = band_for(overall)
-    overrides = []
+    basis = "Weighted score"
+    n3 = max(len(c3["subs"]), 1)
 
-    contradicted = [s for s in c3["subs"] if s["status"] == "contradicted" and s.get("hard", True)]
-    issuer_linked = any(t["result"] == "fail" and "issuer" in t["name"].lower() for t in c1["tests"])
-    if contradicted:
-        band = "Critical"
-        overrides.append("Outside evidence contradicts the deal ("
-                         + "; ".join(s["name"] for s in contradicted) + "): straight to Critical.")
-    elif issuer_linked and BAND_ORDER.index(band) < BAND_ORDER.index("High"):
-        band = "High"
-        overrides.append("Transport document issuer is linked to the borrower, so it does not count "
-                         "as proof (R2): at least High.")
-
+    hard = [s for s in c3["subs"] if s["status"] == "contradicted" and s.get("hard", True)]
+    issuer_fail = next((t for t in c1["tests"] if t.get("issuer_test") and t["result"] == "fail"), None)
     policy_hold = bool(req.get("silent")) and float(req.get("amount") or 0) >= R3_THRESHOLD
-    if policy_hold:
-        overrides.append(f"Large silent deal (US${R3_THRESHOLD/1e6:.0f}m or more): needs a named reviewer "
-                         "and is never paid the same day (R3).")
 
-    # Reasons, ranked by the points each contributes to the overall score
-    reasons = []
+    # ---- adverse findings, most decisive first
+    raw = []
     for s in c3["subs"]:
-        if s["status"] != "confirmed":
-            reasons.append((WEIGHTS["c3"] * s["points"] / max(len(c3["subs"]), 1)
-                            + (1000 if s["status"] == "contradicted" and s.get("hard", True) else 0),
-                            f"{s['name']}: {STATUS_LABEL[s['status']].lower()}. {s['detail']}", s["source"]))
+        if s["status"] == "contradicted":
+            pts = WEIGHTS["c3"] * 100 / n3
+            decisive = s.get("hard", True)
+            effect = (f"Decisive. Override rule 1 sets the band to Critical. Also contributes {pts:.0f} points to the weighted score."
+                      if decisive else f"Contributes {pts:.0f} points to the weighted score. Not treated as a contradiction of the sale.")
+            raw.append((3000 if decisive else pts, dict(check=C3, test_id=s["id"], test=s["name"], result="contradicted" if decisive else "adverse",
+                                                         doc_ref=s["doc_ref"], stated=s["stated"], found=s["detail"],
+                                                         source=s["source"], effect=effect, decisive=decisive)))
     for t in c1["tests"]:
         if t["result"] == "fail":
-            reasons.append((WEIGHTS["c1"] * t["points"] + (500 if "issuer" in t["name"].lower() else 0),
-                            f"{t['name']}: failed. {t['detail']}", t["source"]))
-    if c2["health"] < 50:
-        reasons.append((WEIGHTS["c2"] * 0.5 * (100 - c2["health"]), "Company health is weak. " + c2["health_detail"],
-                        "Accounts held by the bank"))
+            pts = WEIGHTS["c1"] * t["points"]
+            if t.get("issuer_test"):
+                effect = (f"Override rule 2 sets the band to at least High. Also contributes {pts:.0f} points to the weighted score.")
+            else:
+                effect = f"Contributes {pts:.0f} points to the weighted score."
+            raw.append((2000 if t.get("issuer_test") else pts,
+                        dict(check=C1, test_id=t["id"], test=t["name"], result="fail", doc_ref=t["doc_ref"],
+                             stated=t["stated"], found=t["found"], source=t["source"], effect=effect,
+                             decisive=bool(t.get("issuer_test")) and not hard)))
+    if c2["has_accounts"] and c2["health"] < 50:
+        pts = WEIGHTS["c2"] * 0.5 * (100 - c2["health"])
+        raw.append((pts, dict(check=C2, test_id="2.1", test="Financial health", result="adverse", doc_ref=ACCOUNTS_REF,
+                              stated="Seven balance-sheet figures used in the Altman Z'' formula.",
+                              found=c2["health_detail"], source="Example data: accounts held by the bank",
+                              effect=f"Contributes {pts:.0f} points to the weighted score.", decisive=False)))
     for r in c2["signals"]:
-        if r["score"] >= 50 and r["normal"] is not None:
-            reasons.append((WEIGHTS["c2"] * 0.5 * r["score"] / 5,
-                            f"{r['signal']} is unusual for this company: {r['recent']} in the last 90 days "
-                            f"against a normal of {r['normal']}.", "Public signals"))
-    reasons.sort(key=lambda r: -r[0])
-    reasons = [dict(text=r[1], source=r[2]) for r in reasons]
+        if r["normal"] is not None and r["score"] >= 50:
+            pts = WEIGHTS["c2"] * 0.5 * r["score"] / len(SIGNALS)
+            raw.append((pts, dict(check=C2, test_id="2.2", test=f"Behaviour: {r['signal'].lower()}", result="adverse",
+                                  doc_ref=SIGNALS_REF, stated=f"Normal level for this company: {r['normal']} per 90 days.",
+                                  found=f"{r['recent']} in the last 90 days.",
+                                  source="Example data: news, ACRA and court records",
+                                  effect=f"Contributes {pts:.0f} points to the weighted score.", decisive=False)))
+    raw.sort(key=lambda x: -x[0])
+    findings = [dict(f, id=f"F{i}") for i, (_, f) in enumerate(raw, start=1)]
 
-    unchecked = [f"{s['name']}: {s['detail']}" for s in c3["subs"] if s["status"] == "unchecked"]
-    unchecked += [f"{t['name']}: {t['detail']}" for t in c1["tests"] if t["result"] == "unchecked"]
+    # ---- items that could not be verified
+    unverified = []
+    for s in c3["subs"]:
+        if s["status"] == "unchecked":
+            unverified.append(dict(check=C3, test_id=s["id"], test=s["name"], doc_ref=s["doc_ref"], reason=s["detail"],
+                                   source=s["source"], effect=f"Scored 50, not 0. Contributes {WEIGHTS['c3'] * 50 / n3:.0f} points."))
+    for t in c1["tests"]:
+        if t["result"] == "unchecked":
+            unverified.append(dict(check=C1, test_id=t["id"], test=t["name"], doc_ref=t["doc_ref"], reason=t["found"],
+                                   source=t["source"], effect="No points added. Reported so the gap is visible."))
     if not c2["has_accounts"]:
-        unchecked.append("Company health: no accounts held.")
-    unchecked += [f"{r['signal']}: too little history." for r in c2["signals"] if r["normal"] is None]
+        unverified.append(dict(check=C2, test_id="2.1", test="Financial health", doc_ref=ACCOUNTS_REF,
+                               reason="The bank holds no accounts for this borrower.", source="Accounts held by the bank",
+                               effect=f"Scored 50. Contributes {WEIGHTS['c2'] * 0.5 * 50:.1f} points."))
+    short = [r["signal"] for r in c2["signals"] if r["normal"] is None]
+    if short:
+        unverified.append(dict(check=C2, test_id="2.2", test="Behaviour: " + ", ".join(x.lower() for x in short),
+                               doc_ref=SIGNALS_REF, reason=f"Fewer than {MIN_HISTORY} earlier 90-day periods on record.",
+                               source="Example data: news, ACRA and court records",
+                               effect=f"Each scored 50. Contributes {WEIGHTS['c2'] * 0.5 * 50 * len(short) / len(SIGNALS):.1f} points."))
+
+    # ---- how the band was determined
+    steps = [f"Weighted score: 0.3 × {c1['score']:.0f} (Check 1) + 0.3 × {c2['score']:.0f} (Check 2) + 0.4 × "
+             f"{c3['score']:.0f} (Check 3) = {overall:.1f}. On the score alone this is the {base_band} band "
+             f"({BAND_RANGE[base_band]})."]
+    ids = lambda pred: ", ".join(f["id"] for f in findings if pred(f))
+    if hard:
+        band = "Critical"
+        basis = "Override rule 1: independent evidence contradicts the transaction"
+        steps.append("Override rule 1 (contradiction): applies. " + ids(lambda f: f["check"] == C3 and f["result"] == "contradicted")
+                     + " records independent evidence that contradicts the transaction as documented. "
+                       "The band is set to Critical whatever the weighted score.")
+    else:
+        steps.append("Override rule 1 (contradiction): does not apply. No independent source contradicts the transaction.")
+    if issuer_fail:
+        fid = ids(lambda f: f["test_id"] == "1.3")
+        if hard:
+            steps.append(f"Override rule 2 (linked issuer): applies ({fid}), but the band is already Critical under rule 1.")
+        elif BAND_ORDER.index(band) < BAND_ORDER.index("High"):
+            band = "High"
+            basis = "Override rule 2: the transport document was issued or signed by a party linked to the borrower"
+            steps.append(f"Override rule 2 (linked issuer): applies ({fid}). A transport document issued or signed by a "
+                         "party linked to the borrower does not count as independent proof (recommendation R2). "
+                         "The band is raised to High.")
+        else:
+            steps.append(f"Override rule 2 (linked issuer): applies ({fid}), but the weighted score already places the request at {band}.")
+    else:
+        steps.append("Override rule 2 (linked issuer): does not apply.")
+    if policy_hold:
+        steps.append(f"Policy rule R3 (large silent deal): applies. The facility is silent and the amount is "
+                     f"US${R3_THRESHOLD / 1e6:.0f} million or more, so a named reviewer must approve it and it cannot "
+                     "be paid on the day of the request.")
+    else:
+        steps.append("Policy rule R3 (large silent deal): does not apply.")
 
     if band == "Critical":
         status = "Blocked"
@@ -225,7 +284,44 @@ def score_request(req, ev):
         status = "Awaiting officer note"
     else:
         status = "Paid"
+    action = BAND_ACTION[band]
+    if status == "Held (large silent deal)":
+        action = "Payment held until a named Risk Management Unit reviewer approves it, under policy rule R3."
+    steps.append(f"Outcome: {band} band. {action}")
 
-    return dict(c1=c1, c2=c2, c3=c3, overall=round(overall, 1), base_band=base_band, band=band,
-                overrides=overrides, policy_hold=policy_hold, reasons=reasons, unchecked=unchecked,
-                status=status, action=BAND_ACTION[band], needs_review=status in ("Blocked", "Held", "Held (large silent deal)"))
+    # ---- plain-language explanation of a band or hold that the score alone would not give
+    explanation = []
+    if band != base_band:
+        lead = next((f for f in findings if f["decisive"]), findings[0] if findings else None)
+        pts = (WEIGHTS["c3"] * 100 / n3) if hard else WEIGHTS["c1"] * 40
+        explanation = [
+            ("Weighted score", f"{overall:.0f} out of 100. On the score alone the request would be {base_band} "
+                               f"({BAND_RANGE[base_band]})."),
+            ("Band applied", f"{band}, under {basis[0].lower() + basis[1:]}."),
+            ("Decisive finding", f"{lead['id']}: {lead['check']}, test {lead['test_id']} ({lead['test']})."),
+            ("Document examined", lead["doc_ref"] + "."),
+            ("The document states", lead["stated"]),
+            ("The evidence shows", f"{lead['found']} Source: {lead['source']}."),
+            ("Why the rule applies",
+             "A transaction that an independent source contradicts cannot be treated as low risk, whatever the other "
+             "tests show. Override rule 1 therefore sets the band to Critical." if hard else
+             "A transport document issued or signed by a party linked to the borrower is not independent proof that "
+             "the goods moved (recommendation R2). Override rule 2 therefore sets the band to at least High."),
+            ("Why the score is low", f"The score is a weighted average across all the tests in the three checks. This finding moves it by only "
+                                     f"{pts:.0f} points and the remaining tests found little or nothing adverse. The "
+                                     "override rules exist so that one decisive finding is not averaged away."),
+        ]
+    elif status == "Held (large silent deal)":
+        explanation = [
+            ("Weighted score", f"{overall:.0f} out of 100, which is the {band} band. No override rule applies."),
+            ("Why payment is held", f"The facility is silent and the amount is US${R3_THRESHOLD / 1e6:.0f} million or more. "
+                                    "Policy rule R3 requires a named Risk Management Unit reviewer for such a request "
+                                    "and does not allow payment on the day it is received."),
+            ("What the reviewer decides", "Whether the evidence gathered is sufficient to release the payment, given "
+                                          "that the buyer cannot be asked to confirm the sale."),
+        ]
+
+    return dict(c1=c1, c2=c2, c3=c3, overall=round(overall, 1), base_band=base_band, band=band, basis=basis,
+                steps=steps, explanation=explanation, findings=findings, unverified=unverified,
+                policy_hold=policy_hold, status=status, action=action,
+                needs_review=status in ("Blocked", "Held", "Held (large silent deal)"))

@@ -1,4 +1,5 @@
 """Trade Authenticity Risk Scorer: Streamlit demonstrator (IS4234 Group 14)."""
+import html
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -27,7 +28,7 @@ FIN_FIELDS = {"current_assets": "Current assets", "current_liabilities": "Curren
               "total_assets": "Total assets", "retained_earnings": "Retained earnings",
               "ebit": "Earnings before interest and tax", "equity": "Equity", "total_liabilities": "Total liabilities"}
 
-st.set_page_config(page_title="Trade Authenticity Risk Scorer", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Trade Authenticity Risk Scorer", layout="wide")
 ss = st.session_state
 
 
@@ -44,9 +45,69 @@ def money(x):
     return f"US${x:,.0f}" if x < 1e6 else f"US${x / 1e6:,.2f}m"
 
 
-def badge(band):
-    return (f"<span style='background:{BAND_COLOUR[band]};color:white;padding:3px 12px;border-radius:12px;"
-            f"font-weight:600'>{band.upper()}</span>")
+OUTCOME = {
+    "Blocked": "Payment blocked", "Held": "Payment held", "Held (large silent deal)": "Payment held",
+    "Awaiting officer note": "Payment pending officer note", "Paid": "Payment released",
+    "Paid (note recorded)": "Payment released after officer note", "Released by reviewer": "Payment released by reviewer",
+    "On hold: more information requested": "Payment on hold: more information requested", "Rejected": "Request rejected",
+}
+PILL = {"pass": "#2e7d32", "confirmed": "#2e7d32", "fail": "#c62828", "contradicted": "#c62828",
+        "adverse": "#b45309", "unchecked": "#6b7280"}
+CSS = """<style>
+.tar-card{border:1px solid rgba(128,128,128,.35);border-left:6px solid var(--c,#888);border-radius:6px;
+  padding:16px 20px;margin:4px 0 16px}
+.tar-label{font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;opacity:.7;font-weight:600;margin:0 0 4px}
+.tar-outcome{font-size:1.4rem;font-weight:700;margin:0 0 4px;line-height:1.25}
+.tar-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin-top:14px;
+  border-top:1px solid rgba(128,128,128,.25);padding-top:12px}
+.tar-grid .v{font-size:1.02rem;font-weight:600;line-height:1.35}
+.tar-kv{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px 24px}
+table.tar{width:100%;border-collapse:collapse;font-size:.86rem;margin:2px 0 16px}
+table.tar th{text-align:left;font-size:.7rem;letter-spacing:.06em;text-transform:uppercase;opacity:.7;
+  border-bottom:2px solid rgba(128,128,128,.45);padding:6px 10px;vertical-align:bottom;font-weight:600}
+table.tar td{border-bottom:1px solid rgba(128,128,128,.22);padding:9px 10px;vertical-align:top;line-height:1.45}
+table.tar td.num{text-align:right;white-space:nowrap}
+.tar-pill{display:inline-block;padding:2px 9px;border-radius:3px;font-size:.7rem;font-weight:700;letter-spacing:.05em;
+  text-transform:uppercase;white-space:nowrap;color:#fff}
+.tar-src{display:inline-block;padding:1px 7px;border:1px solid currentColor;border-radius:3px;font-size:.66rem;
+  font-weight:600;letter-spacing:.05em;text-transform:uppercase;white-space:nowrap;opacity:.8;margin-bottom:3px}
+.tar-note{font-size:.84rem;opacity:.75}
+</style>"""
+
+
+def esc(x):
+    return html.escape(str(x if x is not None else ""))
+
+
+def pill(result, text=None):
+    return f"<span class='tar-pill' style='background:{PILL[result]}'>{esc(text or engine.RESULT_LABEL[result])}</span>"
+
+
+def band_pill(band):
+    return f"<span class='tar-pill' style='background:{BAND_COLOUR[band]};font-size:.8rem;padding:3px 12px'>{band}</span>"
+
+
+def src(source):
+    """Source label: whether the evidence is live, example data, or entered by hand."""
+    kind, _, rest = source.partition(":")
+    if kind.startswith("Live"):
+        tag, rest = "Live source", rest.strip()
+    elif kind.startswith("Example"):
+        tag, rest = "Example data", rest.strip()
+    elif source == "Entered by hand":
+        tag, rest = "Manual entry", ""
+    elif source == "Not connected":
+        tag, rest = "Not connected", ""
+    else:
+        tag, rest = "Bank record", source
+    rest = rest[:1].upper() + rest[1:]
+    return f"<span class='tar-src'>{tag}</span>" + (f"<br>{esc(rest)}" if rest else "")
+
+
+def html_table(headers, rows):
+    head = "".join(f"<th style='width:{w}'>{esc(h)}</th>" if w else f"<th>{esc(h)}</th>" for h, w in headers)
+    body = "".join("<tr>" + "".join(c if c.startswith("<td") else f"<td>{c}</td>" for c in row) + "</tr>" for row in rows)
+    st.markdown(f"<table class='tar'><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>", unsafe_allow_html=True)
 
 
 def log(event, req_id, actor, detail, when=None):
@@ -75,31 +136,46 @@ def gleif_lookup(name):
 def alert_email(rec):
     r, q = rec["result"], rec["req"]
     urgent = r["band"] == "Critical"
-    lines = [
-        f"Request {rec['id']} has been {'BLOCKED' if urgent else 'HELD'} before payout.",
+    L = [
+        f"Request {rec['id']}: {OUTCOME[r['status']].lower()} before payout.",
         "",
-        f"Borrower: {q['borrower']}",
-        f"Buyer: {q['buyer']}",
-        f"Amount: {money(q['amount'])}   Facility: {'Silent (buyer not notified)' if q['silent'] else 'Disclosed'}",
-        f"Invoice: {q['invoice_no']}   Transport document: {q['doc_type']}",
-        f"Submitted by: {rec['officer']} at {rec['submitted']}",
+        "REQUEST",
+        f"  Borrower:            {q['borrower']}",
+        f"  Buyer:               {q['buyer']}",
+        f"  Amount:              {money(q['amount'])}",
+        f"  Facility:            {'Silent (buyer not notified)' if q['silent'] else 'Disclosed'}",
+        f"  Invoice:             {q['invoice_no'] or 'not stated'}",
+        f"  Transport document:  {q['doc_type']}",
+        f"  Submitted by:        {rec['officer']} at {rec['submitted']}",
         "",
-        f"Risk score: {r['overall']:.0f}/100   Band: {r['band']}",
+        "DECISION",
+        f"  Band:                {r['band']}",
+        f"  Basis:               {r['basis']}",
+        f"  Weighted score:      {r['overall']:.0f} of 100 ({r['base_band']} on the score alone)",
         f"  Check 1 Documents:   {r['c1']['score']:.0f}",
         f"  Check 2 Company:     {r['c2']['score']:.0f}",
         f"  Check 3 Transaction: {r['c3']['score']:.0f}",
+        "",
+        "FINDINGS",
     ]
-    if r["overrides"]:
-        lines += ["", "Rules applied:"] + [f"  - {o}" for o in r["overrides"]]
-    lines += ["", "Top reasons:"] + ([f"  {i + 1}. {x['text']} [{x['source']}]" for i, x in enumerate(r["reasons"][:3])]
-                                    or ["  None above threshold."])
-    lines += ["", "Could not be checked:"] + ([f"  - {u}" for u in r["unchecked"]] or ["  Nothing."])
-    lines += ["", "Recommended action: " + ("Do not release. Verify the transaction through an independent party "
-                                             "before any payout." if urgent else
-                                             "Review the evidence and decide to release, hold or reject by name.")]
+    if not r["findings"]:
+        L.append("  No adverse findings.")
+    for f in r["findings"][:3]:
+        L += [f"  {f['id']}. {f['check']}, test {f['test_id']}: {f['test']}",
+              f"      Document: {f['doc_ref']}",
+              f"      Stated:   {f['stated']}",
+              f"      Found:    {f['found']}",
+              f"      Source:   {f['source']}",
+              f"      Effect:   {f['effect']}"]
+    L += ["", "NOT VERIFIED"]
+    L += [f"  - {u['check']}, test {u['test_id']}: {u['reason']}" for u in r["unverified"]] or ["  Nothing. Every test returned a result."]
+    L += ["", "HOW THE BAND WAS DETERMINED"] + [f"  {i}. {x}" for i, x in enumerate(r["steps"], start=1)]
+    L += ["", "RECOMMENDED ACTION",
+          "  " + ("Do not release. Verify the transaction through an independent party before any payout."
+                  if urgent else "Review the findings and record a decision to release, hold or reject.")]
     return dict(to="rmu-alerts@demo-bank.example", time=rec["submitted"], urgent=urgent,
-                subject=f"{'[URGENT] ' if urgent else ''}{r['band']} risk: {rec['id']} {q['borrower']} {money(q['amount'])}",
-                body="\n".join(lines))
+                subject=f"{'URGENT: ' if urgent else ''}{r['band']} risk, {rec['id']}, {q['borrower']}, {money(q['amount'])}",
+                body="\n".join(L))
 
 
 def create_record(req, ev, officer, when=None):
@@ -110,13 +186,14 @@ def create_record(req, ev, officer, when=None):
                note="", decision=None, alert=None)
     ss.records.append(rec)
     log("Request scored", rid, "Scorer (automatic)",
-        f"Score {res['overall']:.0f}, band {res['band']}"
-        + (f" (raised from {res['base_band']})" if res["band"] != res["base_band"] else "")
-        + f". Checks: {res['c1']['score']:.0f} / {res['c2']['score']:.0f} / {res['c3']['score']:.0f}. Status: {res['status']}.",
-        when)
-    for o in res["overrides"]:
-        log("Rule applied", rid, "Scorer (automatic)", o, when)
-    if q_silent := req.get("silent"):
+        f"Weighted score {res['overall']:.0f} ({res['base_band']} on the score alone). Final band {res['band']}. "
+        f"Basis: {res['basis']}. Checks: {res['c1']['score']:.0f} / {res['c2']['score']:.0f} / {res['c3']['score']:.0f}. "
+        f"Status: {res['status']}.", when)
+    for f in res["findings"]:
+        log("Finding recorded", rid, "Scorer (automatic)",
+            f"{f['id']} ({f['check']}, test {f['test_id']}). Document: {f['doc_ref']}. Stated: {f['stated']} "
+            f"Found: {f['found']} Source: {f['source']}. Effect: {f['effect']}", when)
+    if req.get("silent"):
         log("Exception recorded", rid, "Scorer (automatic)",
             "Silent deal: buyer acknowledgement of assignment not obtained (ABS Code). Recorded as an exception (R4).", when)
     if res["needs_review"]:
@@ -127,11 +204,12 @@ def create_record(req, ev, officer, when=None):
     return rec
 
 
-def decide(rec, action, reviewer, reason, when=None):
+def decide(rec, action, reviewer, reason, cited=None, when=None):
     new = {"Release": "Released by reviewer", "Hold": "On hold: more information requested", "Reject": "Rejected"}[action]
     rec["status"] = new
-    rec["decision"] = dict(action=action, by=reviewer, reason=reason, at=ts(when or now()))
-    log(f"Decision: {action.lower()}", rec["id"], reviewer, reason, when)
+    rec["decision"] = dict(action=action, by=reviewer, reason=reason, cited=list(cited or []), at=ts(when or now()))
+    log(f"Decision: {action.lower()}", rec["id"], reviewer,
+        reason + (f" Findings relied on: {', '.join(cited)}." if cited else ""), when)
     if action == "Release":
         log("Payment released", rec["id"], reviewer, "Released after named review.", when)
 
@@ -159,7 +237,8 @@ def seed():
             if dec[0] == "Note":
                 add_note(rec, dec[1], dec[2], when + timedelta(minutes=20))
             else:
-                decide(rec, dec[0], dec[1], dec[2], when + timedelta(hours=3))
+                decide(rec, dec[0], dec[1], dec[2], [f["id"] for f in rec["result"]["findings"][:2]],
+                       when + timedelta(hours=3))
 
 
 def reset_form():
@@ -176,7 +255,7 @@ def reset_form():
     for k in ("registry", "movement", "buyer", "price", "news"):
         ss["ov_" + k] = OV_OPTIONS[0]
     ss.ov_issuer = "Use example table"
-    ss.docs, ss.forensics, ss.pack_name, ss.records_note = {}, None, "", ""
+    ss.docs, ss.forensics, ss.pack_name, ss.records_note, ss.pages = {}, None, "", "", {}
 
 
 def load_pack(data, name):
@@ -188,7 +267,7 @@ def load_pack(data, name):
         ss["f_" + k] = float(fields.get(k) or 0)
     ss.f_silent = bool(fields.get("silent"))
     ss.f_doc_type = fields["doc_type"] if fields.get("doc_type") in cases.DOC_TYPES else cases.DOC_TYPES[0]
-    ss.docs, ss.forensics, ss.pack_name = docs, forensics, name
+    ss.docs, ss.forensics, ss.pack_name, ss.pages = docs, forensics, name, fields.get("pages", {})
     rec = cases.BORROWER_RECORDS.get(ss.f_borrower.strip().lower())
     if rec:
         ss.f_has_accounts, ss.records_note = True, rec["note"]
@@ -236,100 +315,154 @@ def collect_request():
     fields["financials"] = {k: float(ss["fin_" + k]) for k in FIN_FIELDS} if ss.f_has_accounts else None
     fields["signals"] = {k: dict(recent=ss[f"sig_{k}_recent"], history=parse_hist(ss[f"sig_{k}_hist"]))
                          for k in engine.SIGNALS}
-    req = cases.build_request(fields, ss.docs, ss.forensics)
+    fields["pages"] = ss.pages
+    req = cases.build_request(fields, ss.docs, ss.forensics, ss.pack_name)
     req["records_note"] = ss.records_note
-    req["pack_name"] = ss.pack_name
     overrides = {k: ss["ov_" + k] for k in ("registry", "movement", "buyer", "price", "news")}
     overrides["issuer"] = ss.ov_issuer
     return req, overrides
 
 
 # ------------------------------------------------------------------ result view
-def src_tag(source):
-    if source.startswith("Live"):
-        return "🟢 " + source
-    if source.startswith("Example"):
-        return "🟡 " + source
-    return "⚪ " + source
+def section(title, caption=None):
+    st.markdown(f"<div class='tar-label' style='margin-top:18px'>{esc(title)}</div>", unsafe_allow_html=True)
+    if caption:
+        st.markdown(f"<div class='tar-note' style='margin-bottom:6px'>{esc(caption)}</div>", unsafe_allow_html=True)
+
+
+def test_rows(items, c3=False):
+    rows = []
+    for t in items:
+        result = t["status"] if c3 else t["result"]
+        if c3 and result == "contradicted" and not t.get("hard", True):
+            result = "adverse"
+        rows.append([f"<td class='num'>{esc(t['id'])}</td>", f"<b>{esc(t['name'])}</b>", pill(result),
+                     esc(t["doc_ref"]), esc(t["stated"]), esc(t["detail"] if c3 else t["found"]), src(t["source"]),
+                     f"<td class='num'>{t['points']:.0f}</td>"])
+    return rows
+
+
+TEST_HEADERS = [("Test", "4%"), ("What is tested", "15%"), ("Result", "9%"), ("Document examined", "19%"),
+                ("Stated in the document", "19%"), ("Evidence found", "20%"), ("Source", "9%"), ("Points", "5%")]
 
 
 def render_result(rec, show_email=False):
     r, q = rec["result"], rec["req"]
-    a, b, c, d = st.columns([1.1, 1.2, 2, 2])
-    a.metric("Risk score", f"{r['overall']:.0f} / 100")
-    b.markdown("**Band**<br>" + badge(r["band"]), unsafe_allow_html=True)
-    c.markdown(f"**Payment status**<br>{rec['status']}", unsafe_allow_html=True)
-    d.markdown(f"**{q['borrower']}** to **{q['buyer']}**<br>{money(q['amount'])}, "
-               f"{'silent' if q['silent'] else 'disclosed'}, invoice {q['invoice_no'] or 'n/a'}", unsafe_allow_html=True)
-    st.caption("A risk score, not a probability of fraud. It supports the reviewer's judgement and does not prove fraud.")
-    if r["band"] != r["base_band"]:
-        st.error(f"The score alone gives **{r['base_band']}**. A rule raised the band to **{r['band']}**.")
-    for o in r["overrides"]:
-        st.warning("Rule applied: " + o)
-    st.info("What happens next: " + (r["action"] if not (r["policy_hold"] and r["band"] in ("Low", "Medium"))
-                                     else "Held for a named reviewer because it is a large silent deal (R3)."))
+    st.markdown(CSS, unsafe_allow_html=True)
+    dcn = rec["decision"]
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.subheader(f"Check 1: Documents · {r['c1']['score']:.0f}")
-        st.caption("Weight 30%. Issuer failure adds 40, each other failure adds 30.")
-        for t in r["c1"]["tests"]:
-            icon = {"pass": "✅", "fail": "❌", "unchecked": "❔"}[t["result"]]
-            st.markdown(f"{icon} **{t['name']}** (+{t['points']})  \n{t['detail']}  \n<small>{src_tag(t['source'])}</small>",
-                        unsafe_allow_html=True)
-    with c2:
-        st.subheader(f"Check 2: Company · {r['c2']['score']:.0f}")
-        st.caption("Weight 30%. Half financial health (Altman Z''), half deviation from the company's own normal.")
-        st.markdown(f"**Health:** {r['c2']['health_detail']}  \n<small>{src_tag('Example data: accounts held by the bank')}</small>",
+    # ---- 1. Decision
+    if dcn:
+        sub = f"{dcn['action']} recorded by {dcn['by']} at {dcn['at']}."
+    elif rec["note"]:
+        sub = "Released after the submitting officer recorded a note."
+    else:
+        sub = r["action"]
+    st.markdown(
+        f"<div class='tar-card' style='--c:{BAND_COLOUR[r['band']]}'>"
+        f"<div class='tar-label'>Decision record · {esc(rec['id'])}</div>"
+        f"<div class='tar-outcome'>{esc(OUTCOME[rec['status']])}</div><div>{esc(sub)}</div>"
+        f"<div class='tar-grid'>"
+        f"<div><div class='tar-label'>Risk band</div><div class='v'>{band_pill(r['band'])}</div></div>"
+        f"<div><div class='tar-label'>Weighted score</div><div class='v'>{r['overall']:.0f} of 100</div></div>"
+        f"<div><div class='tar-label'>Band on the score alone</div><div class='v'>{r['base_band']} ({engine.BAND_RANGE[r['base_band']]})</div></div>"
+        f"<div><div class='tar-label'>Basis of the band</div><div class='v'>{esc(r['basis'])}</div></div>"
+        f"</div></div>", unsafe_allow_html=True)
+
+    # ---- 2. Why, when the band or the hold is not explained by the score
+    if r["explanation"]:
+        title = "Why the band is higher than the score indicates" if r["band"] != r["base_band"] else "Why payment is held"
+        rows = "".join(f"<tr><td style='width:20%;font-weight:600'>{esc(k)}</td><td>{esc(v)}</td></tr>" for k, v in r["explanation"])
+        st.markdown(f"<div class='tar-card' style='--c:{BAND_COLOUR[r['band']]}'><div class='tar-label'>{title}</div>"
+                    f"<table class='tar' style='margin:6px 0 0'><tbody>{rows}</tbody></table></div>", unsafe_allow_html=True)
+
+    # ---- 3. Findings
+    section("Findings supporting the decision",
+            "Each finding names the check and test, the document and field examined, what the document states, "
+            "and the evidence that was found.")
+    if r["findings"]:
+        html_table([("Ref", "4%"), ("Check and test", "15%"), ("Document examined", "18%"), ("Stated in the document", "18%"),
+                    ("Evidence found", "19%"), ("Source", "9%"), ("Effect on the decision", "17%")],
+                   [[f"<b>{f['id']}</b>",
+                     f"{esc(f['check'])}<br>Test {esc(f['test_id'])}: {esc(f['test'])}<br>{pill(f['result'])}",
+                     esc(f["doc_ref"]), esc(f["stated"]), esc(f["found"]), src(f["source"]), esc(f["effect"])]
+                    for f in r["findings"]])
+    else:
+        st.markdown("No adverse findings. Every test either passed or is listed below as not verified.")
+
+    section("Items that could not be verified",
+            "An unverified item is never scored as safe. It is reported here so the gap is visible to the reviewer.")
+    if r["unverified"]:
+        html_table([("Check and test", "20%"), ("Document examined", "24%"), ("Why it could not be verified", "28%"),
+                    ("Source", "10%"), ("Effect on the score", "18%")],
+                   [[f"{esc(u['check'])}<br>Test {esc(u['test_id'])}: {esc(u['test'])}", esc(u["doc_ref"]), esc(u["reason"]),
+                     src(u["source"]), esc(u["effect"])] for u in r["unverified"]])
+    else:
+        st.markdown("None. Every test returned a result.")
+
+    section("How the band was determined")
+    st.markdown("\n".join(f"{i}. {x}" for i, x in enumerate(r["steps"], start=1)))
+
+    # ---- 4. Request
+    section("Request")
+    kv = [("Borrower", q["borrower"]), ("Buyer", q["buyer"]), ("Amount requested", money(q["amount"])),
+          ("Facility", "Silent: buyer not notified" if q["silent"] else "Disclosed to the buyer"),
+          ("Invoice", q["invoice_no"] or "Not stated"), ("Transport document", q["doc_type"]),
+          ("Document pack", q.get("pack_name") or "None: entered by hand"),
+          ("Submitted by", rec["officer"]), ("Submitted at", rec["submitted"])]
+    st.markdown("<div class='tar-card'><div class='tar-kv'>" + "".join(
+        f"<div><div class='tar-label'>{esc(k)}</div><div>{esc(v)}</div></div>" for k, v in kv) + "</div></div>",
+        unsafe_allow_html=True)
+
+    # ---- 5. Detail by check
+    with st.expander(f"Check 1: Documents. Score {r['c1']['score']:.0f} of 100, weight 30%", expanded=True):
+        st.markdown("<div class='tar-note'>Are the documents sound? A linked issuer adds 40 points and each other "
+                    "failure adds 30, to a maximum of 100.</div>", unsafe_allow_html=True)
+        html_table(TEST_HEADERS, test_rows(r["c1"]["tests"]))
+    with st.expander(f"Check 2: Company. Score {r['c2']['score']:.0f} of 100, weight 30%", expanded=True):
+        st.markdown("<div class='tar-note'>Is the company healthy and behaving normally for itself? "
+                    "Check 2 = 0.5 × (100 − financial health) + 0.5 × deviation.</div>", unsafe_allow_html=True)
+        z = r["c2"]["z"]
+        html_table([("Test", "4%"), ("What is tested", "18%"), ("Result", "30%"), ("Basis", "33%"), ("Source", "15%")], [
+            ["<td class='num'>2.1</td>", "<b>Financial health</b>", esc(r["c2"]["health_detail"]),
+             esc((f"X1 {z['x1']:.3f}, X2 {z['x2']:.3f}, X3 {z['x3']:.3f}, X4 {z['x4']:.3f}. " if z else "")
+                 + (q.get("records_note") or "")),
+             src("Example data: accounts held by the bank")],
+            ["<td class='num'>2.2</td>", "<b>Deviation from its own normal</b>",
+             f"{r['c2']['deviation']:.0f} out of 100, the average of the five signals below.",
+             "Last 90 days compared with the company's own earlier 90-day periods over five years.",
+             src("Example data: news, ACRA and court records")]])
+        html_table([("Signal", "24%"), ("Last 90 days", "14%"), ("Normal for this company", "20%"), ("Signal score", "14%"),
+                    ("Reading", "28%")],
+                   [[esc(x["signal"]), f"<td class='num'>{esc(x['recent'])}</td>",
+                     f"<td class='num'>{esc(x['normal'] if x['normal'] is not None else 'Not available')}</td>",
+                     f"<td class='num'>{x['score']:.0f}</td>", esc(x["reading"])] for x in r["c2"]["signals"]])
+        st.markdown(f"Check 2 = 0.5 × (100 − {r['c2']['health']:.0f}) + 0.5 × {r['c2']['deviation']:.0f} = "
+                    f"**{r['c2']['score']:.0f}**")
+    with st.expander(f"Check 3: Transaction. Score {r['c3']['score']:.0f} of 100, weight 40%", expanded=True):
+        st.markdown("<div class='tar-note'>Does independent evidence agree that the sale happened? Verified scores 0, "
+                    "not verified scores 50, contradicted scores 100. Check 3 is the average of the five tests.</div>",
                     unsafe_allow_html=True)
-        if q.get("records_note"):
-            st.caption(q["records_note"])
-        st.markdown(f"**Deviation:** {r['c2']['deviation']:.0f}/100 across five public signals (last 90 days "
-                    f"against the past five years).")
-        st.dataframe(pd.DataFrame(r["c2"]["signals"]).drop(columns=["note"]).rename(columns={
-            "signal": "Signal", "recent": "Last 90 days", "normal": "Its normal", "score": "Score"}),
-            hide_index=True, width="stretch")
-        odd = [x["signal"] for x in r["c2"]["signals"] if x["normal"] is not None and x["score"] >= 50]
-        short = [x["signal"] for x in r["c2"]["signals"] if x["normal"] is None]
-        if odd:
-            st.markdown("Unusual for this company: " + ", ".join(odd) + ".")
-        if short:
-            st.markdown("Too little history to judge: " + ", ".join(short) + ".")
-        st.markdown(f"<small>{src_tag('Example data: news, ACRA and court records')}</small>", unsafe_allow_html=True)
-    with c3:
-        st.subheader(f"Check 3: Transaction · {r['c3']['score']:.0f}")
-        st.caption("Weight 40%. Agrees = 0, could not check = 50, disagrees = 100. Average of five.")
-        for s in r["c3"]["subs"]:
-            icon = {"confirmed": "✅", "unchecked": "❔", "contradicted": "❌"}[s["status"]]
-            st.markdown(f"{icon} **{s['name']}** ({s['points']})  \n{s['detail']}  \n<small>{src_tag(s['source'])}</small>",
-                        unsafe_allow_html=True)
+        html_table(TEST_HEADERS, test_rows(r["c3"]["subs"], c3=True))
+    st.markdown(f"<div class='tar-note'>Weighted score = 0.3 × {r['c1']['score']:.0f} + 0.3 × {r['c2']['score']:.0f} + "
+                f"0.4 × {r['c3']['score']:.0f} = {r['overall']:.1f}. This is a risk score, not a probability of fraud. "
+                "It supports the reviewer's judgement and does not prove fraud.</div>", unsafe_allow_html=True)
 
-    st.markdown(f"**Overall** = 0.3 × {r['c1']['score']:.0f} + 0.3 × {r['c2']['score']:.0f} + 0.4 × {r['c3']['score']:.0f} "
-                f"= **{r['overall']:.1f}**")
-    l, m = st.columns(2)
-    with l:
-        st.markdown("**Top reasons**")
-        if r["reasons"]:
-            for i, x in enumerate(r["reasons"][:3]):
-                st.markdown(f"{i + 1}. {x['text']}")
-        else:
-            st.markdown("No warning signs found.")
-    with m:
-        st.markdown("**Could not be checked**")
-        if r["unchecked"]:
-            for u in r["unchecked"]:
-                st.markdown(f"- {u}")
-        else:
-            st.markdown("Everything was checked.")
+    # ---- 6. Alert, note and decision
     if show_email and rec["alert"]:
-        with st.expander("Alert email sent to the Risk Management Unit", expanded=False):
-            st.code(f"To: {rec['alert']['to']}\nSent: {rec['alert']['time']}\nSubject: {rec['alert']['subject']}\n\n"
+        with st.expander("Alert sent to the Risk Management Unit"):
+            st.code(f"To:      {rec['alert']['to']}\nSent:    {rec['alert']['time']}\nSubject: {rec['alert']['subject']}\n\n"
                     + rec["alert"]["body"], language=None)
-    if rec["decision"]:
-        dcn = rec["decision"]
-        st.success(f"Decision: **{dcn['action']}** by **{dcn['by']}** at {dcn['at']}. Reason: {dcn['reason']}")
     if rec["note"]:
-        st.success(f"Officer note: {rec['note']}")
+        st.markdown(f"<div class='tar-card' style='--c:#2e7d32'><div class='tar-label'>Officer note</div>"
+                    f"{esc(rec['note'])}</div>", unsafe_allow_html=True)
+    if dcn:
+        colour = {"Release": "#2e7d32", "Hold": "#b45309", "Reject": "#c62828"}[dcn["action"]]
+        st.markdown(
+            f"<div class='tar-card' style='--c:{colour}'><div class='tar-label'>Reviewer decision</div>"
+            f"<div class='tar-outcome' style='font-size:1.1rem'>{esc(dcn['action'])} by {esc(dcn['by'])}, {esc(dcn['at'])}</div>"
+            f"<div><b>Findings relied on:</b> {esc(', '.join(dcn.get('cited') or []) or 'None cited')}</div>"
+            f"<div><b>Reason:</b> {esc(dcn['reason'])}</div></div>", unsafe_allow_html=True)
 
 
 def records_table(recs):
@@ -353,7 +486,8 @@ for _k in [k for k in ss.keys() if k.startswith(("f_", "fin_", "sig_", "ov_", "l
 
 # ------------------------------------------------------------------ sidebar
 with st.sidebar:
-    st.title("🛡️ Trade Authenticity Risk Scorer")
+    st.markdown(CSS, unsafe_allow_html=True)
+    st.title("Trade Authenticity Risk Scorer")
     st.caption("IS4234 Group 14 technology demonstrator. A course project, not a bank system and not affiliated "
                "with any bank named in it.")
     role = st.selectbox("Acting as", ROLES, key="role")
@@ -363,8 +497,10 @@ with st.sidebar:
     st.divider()
     st.toggle("Live company lookup (GLEIF)", key="live_gleif",
               help="Looks the buyer up in the public GLEIF register. Falls back to example data if unreachable.")
-    st.markdown("**Evidence labels**  \n🟢 Live source  \n🟡 Example data standing in for a bank-only or paid source  \n"
-                "⚪ Entered by hand or not connected")
+    st.markdown("<div class='tar-label'>Evidence labels</div>"
+                "<div class='tar-note'><span class='tar-src'>Live source</span> Read or looked up in real time<br>"
+                "<span class='tar-src'>Example data</span> Stands in for a bank-only or paid source<br>"
+                "<span class='tar-src'>Manual entry</span> Set by hand on the request form</div>", unsafe_allow_html=True)
     st.divider()
     if st.button("Reset demonstrator"):
         for k in list(ss.keys()):
@@ -469,12 +605,13 @@ if role == ROLES[0]:
                 ss.last_id = rec["id"]
                 if rec["alert"]:
                     st.toast(f"{'Urgent alert' if rec['alert']['urgent'] else 'Alert'} sent to the Risk Management Unit "
-                             f"for {rec['id']}", icon="🚨")
+                             f"for {rec['id']}")
                 else:
-                    st.toast(f"{rec['id']} scored {rec['result']['band']}", icon="✅")
+                    st.toast(f"{rec['id']} scored {rec['result']['band']}")
         last = next((x for x in ss.records if x["id"] == ss.last_id), None)
         if last:
             st.subheader(f"Result for {last['id']}")
+            st.caption("The full decision record is below. It is also sent to the reviewer and written to the evidence log.")
             render_result(last, show_email=True)
 
     with tab_mine:
@@ -519,7 +656,11 @@ elif role == ROLES[1]:
                        "submitted the request.")
             action = st.radio("Action", ["Release", "Hold", "Reject"], horizontal=True, key="act_" + rec["id"],
                               captions=["Pay the request", "Keep on hold and ask for more information", "Refuse the request"])
-            reason = st.text_area("Reason (recorded in the evidence log)", key="reason_" + rec["id"])
+            opts = {f["id"]: f"{f['id']}: {f['check']}, test {f['test_id']}, {f['test']}" for f in rec["result"]["findings"]}
+            cited = st.multiselect("Findings relied on", list(opts), format_func=lambda k: opts[k], key="cite_" + rec["id"],
+                                   help="Select the findings that support this decision. They are recorded with it.")
+            reason = st.text_area("Reason (recorded in the evidence log)", key="reason_" + rec["id"],
+                                  placeholder="State why, with reference to the findings and any further verification carried out.")
             if st.button("Record decision", type="primary", key="dec_" + rec["id"]):
                 if not user:
                     st.error("Enter your name in the sidebar. Decisions must be made by a named reviewer.")
@@ -527,9 +668,11 @@ elif role == ROLES[1]:
                     st.error("Segregation of duties: the submitting officer cannot review their own request.")
                 elif not reason.strip():
                     st.error("A reason is required.")
+                elif action == "Reject" and opts and not cited:
+                    st.error("Select at least one finding that the rejection relies on.")
                 else:
-                    decide(rec, action, user, reason.strip())
-                    st.toast(f"{rec['id']}: {action.lower()} recorded", icon="📝")
+                    decide(rec, action, user, reason.strip(), cited)
+                    st.toast(f"{rec['id']}: {action.lower()} recorded")
                     st.rerun()
     with tab_in:
         alerts = [x for x in reversed(ss.records) if x["alert"]]
@@ -537,14 +680,15 @@ elif role == ROLES[1]:
                    "Risk Management Unit mailbox.")
         for x in alerts:
             a = x["alert"]
-            with st.expander(f"{'🚨' if a['urgent'] else '⚠️'} {a['time']}  {a['subject']}  ·  now: {x['status']}"):
-                st.code(f"To: {a['to']}\nSubject: {a['subject']}\n\n{a['body']}", language=None)
+            with st.expander(f"{a['time']}  |  {a['subject']}  |  Current status: {x['status']}"):
+                st.code(f"To:      {a['to']}\nSubject: {a['subject']}\n\n{a['body']}", language=None)
     with tab_done:
         done = [x for x in ss.records if x["decision"]]
         if done:
             st.dataframe(pd.DataFrame([dict(Request=x["id"], Borrower=x["req"]["borrower"], Amount=money(x["req"]["amount"]),
                                             Band=x["result"]["band"], Decision=x["decision"]["action"],
                                             By=x["decision"]["by"], At=x["decision"]["at"],
+                                            Findings=", ".join(x["decision"].get("cited") or []) or "None cited",
                                             Reason=x["decision"]["reason"]) for x in reversed(done)]),
                          hide_index=True, width="stretch")
         else:
@@ -679,5 +823,5 @@ Price is "near market" within ±{engine.PRICE_BAND:.0%} of the benchmark.
 3. A silent deal of US${engine.R3_THRESHOLD / 1e6:.0f}m or more is held for a named reviewer whatever its score.
 
 **Limits.** The weights and cut-offs are starting values and have not been calibrated. The score is not a probability.
-Sources marked 🟡 return example data in this demonstrator.
+Sources labelled Example data return example data in this demonstrator.
 """)
